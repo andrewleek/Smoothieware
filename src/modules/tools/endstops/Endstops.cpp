@@ -42,6 +42,7 @@
 
 #define endstops_module_enable_checksum         CHECKSUM("endstops_enable")
 #define corexy_homing_checksum                  CHECKSUM("corexy_homing")
+#define corexz_homing_checksum                  CHECKSUM("corexz_homing")
 #define delta_homing_checksum                   CHECKSUM("delta_homing")
 #define rdelta_homing_checksum                  CHECKSUM("rdelta_homing")
 #define scara_homing_checksum                   CHECKSUM("scara_homing")
@@ -194,6 +195,7 @@ void Endstops::load_config()
     this->homing_position[2]        =  this->home_direction[2] ? THEKERNEL->config->value(gamma_min_checksum)->by_default(0)->as_number() : THEKERNEL->config->value(gamma_max_checksum)->by_default(200)->as_number();
 
     this->is_corexy                 =  THEKERNEL->config->value(corexy_homing_checksum)->by_default(false)->as_bool();
+    this->is_corexz                 =  THEKERNEL->config->value(corexz_homing_checksum)->by_default(false)->as_bool();
     this->is_delta                  =  THEKERNEL->config->value(delta_homing_checksum)->by_default(false)->as_bool();
     this->is_rdelta                 =  THEKERNEL->config->value(rdelta_homing_checksum)->by_default(false)->as_bool();
     this->is_scara                  =  THEKERNEL->config->value(scara_homing_checksum)->by_default(false)->as_bool();
@@ -492,6 +494,35 @@ bool Endstops::wait_for_homed_corexy(int axis)
     return true;
 }
 
+bool Endstops::wait_for_homed_corexz(int axis)
+{
+    bool running = true;
+    unsigned int debounce[3] = {0, 0, 0};
+    while (running) {
+        running = false;
+        THEKERNEL->call_event(ON_IDLE);
+
+        // check if on_halt (eg kill)
+        if(THEKERNEL->is_halted()) return false;
+
+        if ( this->pins[axis + (this->home_direction[axis] ? 0 : 3)].get() ) {
+            if ( debounce[axis] < debounce_count ) {
+                debounce[axis] ++;
+                running = true;
+            } else {
+                // turn both off if running
+                if (STEPPER[X_AXIS]->is_moving()) STEPPER[X_AXIS]->move(0, 0);
+                if (STEPPER[Z_AXIS]->is_moving()) STEPPER[Z_AXIS]->move(0, 0);
+            }
+        } else {
+            // The endstop was not hit yet
+            running = true;
+            debounce[axis] = 0;
+        }
+    }
+    return true;
+}
+
 void Endstops::corexy_home(int home_axis, bool dirx, bool diry, float fast_rate, float slow_rate, unsigned int retract_steps)
 {
     // check if on_halt (eg kill)
@@ -528,6 +559,44 @@ void Endstops::corexy_home(int home_axis, bool dirx, bool diry, float fast_rate,
 
     // wait for primary axis
     if(!this->wait_for_homed_corexy(home_axis)) return;
+}
+
+void Endstops::corexz_home(int home_axis, bool dirx, bool dirz, float fast_rate, float slow_rate, unsigned int retract_steps)
+{
+    // check if on_halt (eg kill)
+    if(THEKERNEL->is_halted()) return;
+
+    this->status = MOVING_TO_ENDSTOP_FAST;
+    this->feed_rate[X_AXIS] = fast_rate;
+    STEPPER[X_AXIS]->move(dirx, 10000000, 0);
+    this->feed_rate[Z_AXIS] = fast_rate;
+    STEPPER[Z_AXIS]->move(dirz, 10000000, 0);
+
+    // wait for primary axis
+    if(!this->wait_for_homed_corexz(home_axis)) return;
+
+    // Move back a small distance
+    this->status = MOVING_BACK;
+    this->feed_rate[X_AXIS] = slow_rate;
+    STEPPER[X_AXIS]->move(!dirx, retract_steps, 0);
+    this->feed_rate[Z_AXIS] = slow_rate;
+    STEPPER[Z_AXIS]->move(!dirz, retract_steps, 0);
+
+    // wait until done
+    while ( STEPPER[X_AXIS]->is_moving() || STEPPER[Z_AXIS]->is_moving()) {
+        THEKERNEL->call_event(ON_IDLE);
+        if(THEKERNEL->is_halted()) return;
+    }
+
+    // Start moving the axes to the origin slowly
+    this->status = MOVING_TO_ENDSTOP_SLOW;
+    this->feed_rate[X_AXIS] = slow_rate;
+    STEPPER[X_AXIS]->move(dirx, 10000000, 0);
+    this->feed_rate[Z_AXIS] = slow_rate;
+    STEPPER[Z_AXIS]->move(dirz, 10000000, 0);
+
+    // wait for primary axis
+    if(!this->wait_for_homed_corexz(home_axis)) return;
 }
 
 // this homing works for HBots/CoreXY
@@ -595,6 +664,66 @@ void Endstops::do_homing_corexy(char axes_to_move)
     }
 }
 
+// CoreXZ
+void Endstops::do_homing_corexz(char axes_to_move)
+{
+    if((axes_to_move & 0x05) == 0x05) { // both X and Z need Homing
+        // determine which motor to turn and which way
+        bool dirx = this->home_direction[X_AXIS];
+        bool dirz = this->home_direction[Z_AXIS];
+        int motor;
+        bool dir;
+        if(dirx && dirz) { // min/min
+            motor = X_AXIS;
+            dir = true;
+        } else if(dirx && !dirz) { // min/max
+            motor = Z_AXIS;
+            dir = true;
+        } else if(!dirx && dirz) { // max/min
+            motor = Z_AXIS;
+            dir = false;
+        } else if(!dirx && !dirz) { // max/max
+            motor = X_AXIS;
+            dir = false;
+        }
+
+        // then move both X and Z until one hits the endstop
+        this->status = MOVING_TO_ENDSTOP_FAST;
+        // need to allow for more ground covered when moving diagonally
+        this->feed_rate[motor] = this->fast_rates[motor] * 1.4142;
+        STEPPER[motor]->move(dir, 10000000, 0);
+        // wait until either X or Z hits the endstop
+        bool running = true;
+        while (running) {
+            THEKERNEL->call_event(ON_IDLE);
+            if(THEKERNEL->is_halted()) return;
+            for(int m = X_AXIS; m <= Z_AXIS; m++) {
+                if(this->pins[m + (this->home_direction[m] ? 0 : 3)].get()) {
+                    // turn off motor
+                    if(STEPPER[motor]->is_moving()) STEPPER[motor]->move(0, 0);
+                    running = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // move individual axis
+    if (axes_to_move & 0x01) { // Home X, which means both X and Z in same direction
+        bool dir = this->home_direction[X_AXIS];
+        corexz_home(X_AXIS, dir, dir, this->fast_rates[X_AXIS], this->slow_rates[X_AXIS], this->retract_mm[X_AXIS]*STEPS_PER_MM(X_AXIS));
+    }
+
+    if (axes_to_move & 0x04) { // Home Z, which means both X and Z in different directions
+        bool dir = this->home_direction[Z_AXIS];
+        corexz_home(Z_AXIS, dir, !dir, this->fast_rates[Z_AXIS], this->slow_rates[Z_AXIS], this->retract_mm[Z_AXIS]*STEPS_PER_MM(Z_AXIS));
+    }
+
+    if (axes_to_move & 0x02) { // move Y
+        do_homing_cartesian(0x02); // just home normally for Y
+    }
+}
+
 void Endstops::home(char axes_to_move)
 {
     // not a block move so disable the last tick setting
@@ -605,6 +734,9 @@ void Endstops::home(char axes_to_move)
     if (is_corexy) {
         // corexy/HBot homing
         do_homing_corexy(axes_to_move);
+    } else if(is_corexz) {
+        // corexz
+        do_homing_corexz(axes_to_move);
     } else {
         // cartesian/delta homing
         do_homing_cartesian(axes_to_move);

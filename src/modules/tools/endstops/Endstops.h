@@ -28,9 +28,12 @@ class Endstops : public Module{
         void home(char axes_to_move);
         void do_homing_cartesian(char axes_to_move);
         void do_homing_corexy(char axes_to_move);
+        void do_homing_corexz(char axes_to_move);
         bool wait_for_homed(char axes_to_move);
         bool wait_for_homed_corexy(int axis);
+        bool wait_for_homed_corexz(int axis);
         void corexy_home(int home_axis, bool dirx, bool diry, float fast_rate, float slow_rate, unsigned int retract_steps);
+        void corexz_home(int home_axis, bool dirx, bool dirz, float fast_rate, float slow_rate, unsigned int retract_steps);
         void back_off_home(char axes_to_move);
         void move_to_origin(char);
         void on_get_public_data(void* argument);
@@ -56,6 +59,7 @@ class Endstops : public Module{
         volatile float feed_rate[3];
         struct {
             bool is_corexy:1;
+            bool is_corexz:1;
             bool is_delta:1;
             bool is_rdelta:1;
             bool is_scara:1;
